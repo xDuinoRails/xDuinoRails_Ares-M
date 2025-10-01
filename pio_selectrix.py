@@ -1,115 +1,146 @@
-# selectrix_tx.py  —  SX1 Sender (T0+T1) für RP2040 PIO in MicroPython
-# Autor: Olivier’s Copilot 😉
+# sx_track_tx.py — Selectrix Gleissignal (SX1) mit RP2040 PIO (MicroPython)
 #
-# Hardware:
-#  - RP2040-Pins über Pegelwandler (5V!) an SX-Bus: T0 (Clock), T1 (Daten).
-#  - Niemals +20V an den Pico! T0/T1 sind 5V-Logik, D nur lesen (hier ungenutzt).
-
+# Erzeugt 3-stufiges SX-Gleis-Signal: 10 µs 0V + 40 µs ±V pro Bit
+#
+# Polaritätskodierung nach D&H: gleiche Polarität = '0', unterschiedliche = '1'
+#
+# Block-/Datenstruktur nach NEM 681 (Header + 7 Kanäle à 12 Bit)
+#
+# ACHTUNG: H-Brücke/Booster erforderlich. Nie direkt an die Schienen!
+#
 import _thread
 import utime
 from machine import Pin
 from rp2 import PIO, StateMachine, asm_pio
 
-# === PIO-Programm ===
-# - sideset(1) steuert T0.
-# - out(pins, 1) schiebt 1 Bit aus OSR auf T1 (out_base).
-# - SM-Frequenz = 1 MHz -> 1 Zyklus = 1 µs.
-# - T0 low: 10 µs  (out ... .side(0) [9])   -> währenddessen T1-Bit ausgeben
-# - T0 high: 40 µs (nop       .side(1) [39])
+# ===================== PIO: 2 Pins (IN1, IN2) =====================
 
 @asm_pio(
-    sideset_init = PIO.OUT_LOW,     # T0 initial Low
-    out_init     = PIO.OUT_LOW,         # T1 initial Low
-    out_shiftdir=PIO.SHIFT_LEFT,  # MSB-first aus OSR
-    autopull=True,                # automatisch 32 Bit nachladen
-    pull_thresh=32                # immer volle 32 Bit ziehen
+    set_init=(PIO.OUT_LOW, PIO.OUT_LOW),  # 2 Pins per SET: (IN1, IN2)
+    out_init=(PIO.OUT_LOW, PIO.OUT_LOW),  # dieselben 2 Pins per OUT
+    out_shiftdir=PIO.SHIFT_LEFT,          # MSB->LSB in OSR wird links ausgegeben
+    autopull=True, pull_thresh=32         # wir liefern 32er-Wörter, PIO nimmt sich Bits
 )
-def sx_tx():
+def sx_track():
+    # Pro Datenbit:
+    #  - 10 µs Pause (0 V) => set(pins, 0b00) [9]
+    #  - 40 µs Energie mit gewünschter Polarität:
+    #       out(pins, 2)    (holt 2 Bits aus OSR: b1->IN2, b0->IN1)
+    #       nop() [39]
     wrap_target()
-    # Low-Phase: nächstes T1-Bit ausgeben, T0 = 0, 10 µs halten
-    out(pins, 1).side(0) [9]
-    # High-Phase: T0 = 1, 40 µs halten (T1 bleibt stabil)
-    nop()        .side(1) [39]
+    set(pins, 0b00)   [9]   # 10 µs Pause
+    out(pins, 2)            # 2-Bit-Symbol -> IN2..IN1
+    nop()             [39]  # 40 µs halten
     wrap()
 
-class SelectrixTX:
+# ===================== Host-Seite: Protokollaufbau =====================
+
+class SelectrixTrackTX:
     """
-    Einfache SX1-Zentrale: streamt alle 112 Kanäle (bytes) zyklisch als 16 Blöcke.
-    T0 wird im PIO generiert; T1 wird bitserial nach SX-Codierung ausgegeben.
+    SX1-Zentrale für das Gleissignal.
+    Erzeugt fortlaufend 16 Blöcke (112 Adressen) mit 20 kBit/s (50 µs/Bit).
     """
-    def __init__(self, t0_pin, t1_pin, sm_id=0, sm_freq=1_000_000):
-        self._t0 = Pin(t0_pin, Pin.OUT)
-        self._t1 = Pin(t1_pin, Pin.OUT)
+    def __init__(self, in1_pin, in2_pin, sm_id=0, sm_freq=1_000_000):
+        # 1 MHz => 1 µs / Instruktion (10 + 40 µs Delays)
+        self._in1 = Pin(in1_pin, Pin.OUT, value=0)
+        self._in2 = Pin(in2_pin, Pin.OUT, value=0)
         self.sm = StateMachine(
-            sm_id, sx_tx, freq=sm_freq,
-            sideset_base=self._t0, out_base=self._t1
+            sm_id, sx_track, freq=sm_freq,
+            set_base=self._in1, out_base=self._in1  # 2-Pin-Gruppe: IN1,IN2
         )
-        self.channels = bytearray(112)   # 112 SX-Adressen à 8 Bit
-        self.rail_on = 1                 # Gleisspannung-Bit im Blockheader
+        self.channels = bytearray(112)  # 112 Adressen à 8 Bit
+        self.rail_on = 1                # Z-Bit im Header
         self._frame_words = []
         self._dirty = True
         self._run = False
 
-    # --------- SX-Codierung ---------
+    # ---------- NEM 681: Header- und Datenkodierung ----------
+
     @staticmethod
     def _encode_byte12(value):
-        """8 Bit -> 12 Bit (nach je 2 Datenbits eine '1' einfügen, MSB-first)."""
-        b = int(value) & 0xFF
+        """8->12 Bit: nach je 2 Datenbits eine '1' einfügen (MSB-first)."""
+        v = value & 0xFF
         bits = []
-        pairs = [(7,6), (5,4), (3,2), (1,0)]
-        for hi, lo in pairs:
-            bits.append((b >> hi) & 1)
-            bits.append((b >> lo) & 1)
-            bits.append(1)  # Einschub-1
-        return bits  # Länge 12
+        for hi, lo in ((7,6),(5,4),(3,2),(1,0)):
+            bits.append((v >> hi) & 1)
+            bits.append((v >> lo) & 1)
+            bits.append(1)
+        return bits  # 12 Bits
 
     def _encode_header12(self, base_nibble):
-        """12 Header-Bits: 0001 + rail_on + 1 + (b3 b2 1 b1 b0 1)."""
-        b3 = (base_nibble >> 3) & 1
-        b2 = (base_nibble >> 2) & 1
-        b1 = (base_nibble >> 1) & 1
-        b0 = (base_nibble >> 0) & 1
+        """
+        Header: 0 0 0 1  Z  1  BA3 BA2 1  BA1 BA0 1
+        NEM 681: BA wird invertiert übertragen (BAinv).
+        """
+        ba = base_nibble & 0xF
+        bainv = (~ba) & 0xF
+        b3 = (bainv >> 3) & 1
+        b2 = (bainv >> 2) & 1
+        b1 = (bainv >> 1) & 1
+        b0 = (bainv >> 0) & 1
         return [0,0,0,1, self.rail_on, 1, b3, b2, 1, b1, b0, 1]
 
-    @staticmethod
-    def _bits_to_words_msb_first(bits):
-        """Packt Bitliste (b0 zuerst zu senden) in 32-Bit-Wörter (b0 -> Bit31)."""
-        words = []
-        i = 0
-        n = len(bits)
-        while i < n:
-            w = 0
-            chunk_len = min(32, n - i)
-            for j in range(chunk_len):
-                if bits[i + j]:
-                    w |= (1 << (31 - j))
-            # Rest wird implizit mit 0 gepolstert
-            words.append(w)
-            i += chunk_len
-        return words
-
-    def _encode_block_words(self, base):
+    def _encode_block_bits(self, base):
         """
-        Erzeugt 3x 32-Bit-Wörter (= 96 Bits) für einen SX-Block:
-        12 Bit Header + 7 * (12 Bit Daten) = 96 Bit.
-        Adressen in diesem Block: base, base+16, ..., base+96.
+        Liefert die 96 Bits eines Blocks: 12 Header + 7×12 Daten.
+        Adressen in diesem Block: base, base+16, ..., base+96
         """
         bits = self._encode_header12(base)
         for i in range(7):
             addr = base + 16*i
             bits += self._encode_byte12(self.channels[addr])
-        assert len(bits) == 96
-        return self._bits_to_words_msb_first(bits)  # 3 Wörter
+        return bits  # 96 Bits
+
+    # ---------- Polaritätsabbildung & Wortpacken (2 Pins) ----------
+
+    @staticmethod
+    def _t1bits_to_polarity_symbols(t1_bits, start_polarity=1):
+        """
+        Aus T1-Bitfolge (0=gleiche Pol.; 1=wechselnde Pol.) absolute Polarität erzeugen.
+        Rückgabe: Liste 2-Bit-Symbole pro Datenbit für (IN2..IN1):
+          +V  => '01'  (IN2=0, IN1=1)
+          -V  => '10'  (IN2=1, IN1=0)
+        """
+        pol = 1 if start_polarity else 0  # 1=+V, 0=-V
+        symbols = []
+        for b in t1_bits:
+            if b & 1:  # '1' => toggeln
+                pol ^= 1
+            # Map auf (IN2..IN1):
+            symbols.append(0b01 if pol else 0b10)
+        return symbols
+
+    @staticmethod
+    def _symbols2_to_words(symbols):
+        """
+        Packt 2-Bit-Symbole (MSB-first) in 32-Bit-Wörter für OSR (SHIFT_LEFT).
+        Erstes Symbol -> Bits 31:30, nächstes -> 29:28, ...
+        """
+        out = []
+        i = 0
+        n = len(symbols)
+        while i < n:
+            w = 0
+            take = min(16, n - i)  # 16 Symbole * 2 Bit = 32 Bits
+            for s in range(take):
+                val = symbols[i + s] & 0b11
+                shift = 30 - 2*s
+                w |= (val << shift)
+            out.append(w)
+            i += take
+        return out
 
     def _rebuild_frame(self):
-        """Komplette 16-Blöcke-Frame (48 Wörter) neu aufbauen."""
-        words = []
+        # 16 Blöcke -> 1536 T1-Bits -> 1536 2-Bit-Symbole -> 96 Wörter
+        t1 = []
         for base in range(16):
-            words += self._encode_block_words(base)
-        self._frame_words = words
+            t1 += self._encode_block_bits(base)
+        symbols = self._t1bits_to_polarity_symbols(t1, start_polarity=1)
+        self._frame_words = self._symbols2_to_words(symbols)
         self._dirty = False
 
-    # --------- API ---------
+    # ---------- Public API ----------
+
     def set_track_power(self, on: bool):
         self.rail_on = 1 if on else 0
         self._dirty = True
@@ -129,14 +160,14 @@ class SelectrixTX:
         self._run = False
         utime.sleep_ms(5)
         self.sm.active(0)
+        self._in1.value(0); self._in2.value(0)
 
-    # Hintergrund-Streamer: schiebt fortlaufend 48 Wörter / Frame in die PIO
+    # Hintergrund-Streamer (≈ 96 Wörter pro 76,8 ms)
     def _tx_loop(self):
         while self._run:
-            # ggf. Frame aktualisieren (z.B. nach set_channel)
             if self._dirty:
                 self._rebuild_frame()
             for w in self._frame_words:
                 if not self._run:
                     break
-                self.sm.put(w)  # blockiert, wenn FIFO voll; PIO läuft deterministisch
+                self.sm.put(w)  # PIO verbraucht je 2 Bits/Bitzeit deterministisch
