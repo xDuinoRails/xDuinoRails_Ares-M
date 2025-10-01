@@ -1,69 +1,142 @@
-import machine
-import rp2
-import time
+# selectrix_tx.py  —  SX1 Sender (T0+T1) für RP2040 PIO in MicroPython
+# Autor: Olivier’s Copilot 😉
+#
+# Hardware:
+#  - RP2040-Pins über Pegelwandler (5V!) an SX-Bus: T0 (Clock), T1 (Daten).
+#  - Niemals +20V an den Pico! T0/T1 sind 5V-Logik, D nur lesen (hier ungenutzt).
 
-# --- Configuration ---
-# The GPIO pin to output the 10us signal. 
-# Using GP0 as an example.
-SIGNAL_PIN = 0 
+import _thread
+import utime
+from machine import Pin
+from rp2 import PIO, StateMachine, asm_pio
 
-# Desired PIO state machine frequency (Hz).
-# System clock is typically 125 MHz.
-# To make 1 PIO cycle = 1 microsecond (1 us), we need 1 / 1e-6 = 1,000,000 Hz (1 MHz).
-# The PIO state machine configuration will automatically calculate the required divider (125MHz / 1MHz = 125.0).
-TARGET_FREQ_HZ = 1_000_000 
+# === PIO-Programm ===
+# - sideset(1) steuert T0.
+# - out(pins, 1) schiebt 1 Bit aus OSR auf T1 (out_base).
+# - SM-Frequenz = 1 MHz -> 1 Zyklus = 1 µs.
+# - T0 low: 10 µs  (out ... .side(0) [9])   -> währenddessen T1-Bit ausgeben
+# - T0 high: 40 µs (nop       .side(1) [39])
 
-# --- PIO Program Definition ---
-@rp2.asm_pio(set_init=rp2.PIO.OUT_LOW)
-def pulse_10us():
-    # .wrap_target and .wrap instruct the PIO to loop continuously between these lines.
-    .wrap_target
-    
-    # Set the output pin high for 10 cycles.
-    # The instruction itself takes 1 cycle. The '[9]' adds 9 delay cycles.
-    # Total HIGH time: 1 cycle + 9 cycles = 10 cycles = 10 us (since 1 cycle = 1 us).
-    # 
-    set(pins, 1)        [9] 
-    
-    # Set the output pin low for 10 cycles.
-    # Total LOW time: 1 cycle + 9 cycles = 10 cycles = 10 us.
-    set(pins, 0)        [9] 
-    .wrap
+@asm_pio(
+    sideset_init = PIO.OUT_LOW,     # T0 initial Low
+    out_init     = PIO.OUT_LOW,         # T1 initial Low
+    out_shiftdir=PIO.SHIFT_LEFT,  # MSB-first aus OSR
+    autopull=True,                # automatisch 32 Bit nachladen
+    pull_thresh=32                # immer volle 32 Bit ziehen
+)
+def sx_tx():
+    wrap_target()
+    # Low-Phase: nächstes T1-Bit ausgeben, T0 = 0, 10 µs halten
+    out(pins, 1).side(0) [9]
+    # High-Phase: T0 = 1, 40 µs halten (T1 bleibt stabil)
+    nop()        .side(1) [39]
+    wrap()
 
-# --- Main Application ---
-def start_pio_signal():
+class SelectrixTX:
     """
-    Initializes the PIO State Machine to run the 10us square wave program.
+    Einfache SX1-Zentrale: streamt alle 112 Kanäle (bytes) zyklisch als 16 Blöcke.
+    T0 wird im PIO generiert; T1 wird bitserial nach SX-Codierung ausgegeben.
     """
-    print(f"Starting PIO signal on GP{SIGNAL_PIN} at {TARGET_FREQ_HZ/1e6:.1f} MHz")
-    
-    # Claim a State Machine (sm 0-3 on PIO 0 is typical)
-    # The 'freq' parameter sets the clock divider for us.
-    sm = rp2.StateMachine(
-        0,                             # State Machine ID (0-3)
-        pulse_10us,                    # The PIO assembly program
-        freq=TARGET_FREQ_HZ,           # The target clock frequency (1 MHz)
-        set_base=machine.Pin(SIGNAL_PIN) # The base pin controlled by 'set' instructions
-    )
+    def __init__(self, t0_pin, t1_pin, sm_id=0, sm_freq=1_000_000):
+        self._t0 = Pin(t0_pin, Pin.OUT)
+        self._t1 = Pin(t1_pin, Pin.OUT)
+        self.sm = StateMachine(
+            sm_id, sx_tx, freq=sm_freq,
+            sideset_base=self._t0, out_base=self._t1
+        )
+        self.channels = bytearray(112)   # 112 SX-Adressen à 8 Bit
+        self.rail_on = 1                 # Gleisspannung-Bit im Blockheader
+        self._frame_words = []
+        self._dirty = True
+        self._run = False
 
-    # Start the state machine running
-    sm.active(1)
+    # --------- SX-Codierung ---------
+    @staticmethod
+    def _encode_byte12(value):
+        """8 Bit -> 12 Bit (nach je 2 Datenbits eine '1' einfügen, MSB-first)."""
+        b = int(value) & 0xFF
+        bits = []
+        pairs = [(7,6), (5,4), (3,2), (1,0)]
+        for hi, lo in pairs:
+            bits.append((b >> hi) & 1)
+            bits.append((b >> lo) & 1)
+            bits.append(1)  # Einschub-1
+        return bits  # Länge 12
 
-    # The PIO program runs in the background. The main Python thread can 
-    # now run other code or simply wait.
-    print(f"Signal running. The period is 20 us (50 kHz). Press Ctrl+C to stop.")
+    def _encode_header12(self, base_nibble):
+        """12 Header-Bits: 0001 + rail_on + 1 + (b3 b2 1 b1 b0 1)."""
+        b3 = (base_nibble >> 3) & 1
+        b2 = (base_nibble >> 2) & 1
+        b1 = (base_nibble >> 1) & 1
+        b0 = (base_nibble >> 0) & 1
+        return [0,0,0,1, self.rail_on, 1, b3, b2, 1, b1, b0, 1]
 
-    try:
-        while True:
-            time.sleep(1)
-            # You can add main loop logic here if needed
-            pass
-    except KeyboardInterrupt:
-        print("\nStopping PIO State Machine...")
-        sm.active(0)
-        # Reset the pin mode back to input/safe state
-        machine.Pin(SIGNAL_PIN, machine.Pin.IN, machine.Pin.PULL_DOWN)
-        print("Signal stopped.")
+    @staticmethod
+    def _bits_to_words_msb_first(bits):
+        """Packt Bitliste (b0 zuerst zu senden) in 32-Bit-Wörter (b0 -> Bit31)."""
+        words = []
+        i = 0
+        n = len(bits)
+        while i < n:
+            w = 0
+            chunk_len = min(32, n - i)
+            for j in range(chunk_len):
+                if bits[i + j]:
+                    w |= (1 << (31 - j))
+            # Rest wird implizit mit 0 gepolstert
+            words.append(w)
+            i += chunk_len
+        return words
 
-if __name__ == "__main__":
-    start_pio_signal()
+    def _encode_block_words(self, base):
+        """
+        Erzeugt 3x 32-Bit-Wörter (= 96 Bits) für einen SX-Block:
+        12 Bit Header + 7 * (12 Bit Daten) = 96 Bit.
+        Adressen in diesem Block: base, base+16, ..., base+96.
+        """
+        bits = self._encode_header12(base)
+        for i in range(7):
+            addr = base + 16*i
+            bits += self._encode_byte12(self.channels[addr])
+        assert len(bits) == 96
+        return self._bits_to_words_msb_first(bits)  # 3 Wörter
+
+    def _rebuild_frame(self):
+        """Komplette 16-Blöcke-Frame (48 Wörter) neu aufbauen."""
+        words = []
+        for base in range(16):
+            words += self._encode_block_words(base)
+        self._frame_words = words
+        self._dirty = False
+
+    # --------- API ---------
+    def set_track_power(self, on: bool):
+        self.rail_on = 1 if on else 0
+        self._dirty = True
+
+    def set_channel(self, addr: int, value: int):
+        if 0 <= addr < 112:
+            self.channels[addr] = value & 0xFF
+            self._dirty = True
+
+    def start(self):
+        self._rebuild_frame()
+        self.sm.active(1)
+        self._run = True
+        _thread.start_new_thread(self._tx_loop, ())
+
+    def stop(self):
+        self._run = False
+        utime.sleep_ms(5)
+        self.sm.active(0)
+
+    # Hintergrund-Streamer: schiebt fortlaufend 48 Wörter / Frame in die PIO
+    def _tx_loop(self):
+        while self._run:
+            # ggf. Frame aktualisieren (z.B. nach set_channel)
+            if self._dirty:
+                self._rebuild_frame()
+            for w in self._frame_words:
+                if not self._run:
+                    break
+                self.sm.put(w)  # blockiert, wenn FIFO voll; PIO läuft deterministisch
